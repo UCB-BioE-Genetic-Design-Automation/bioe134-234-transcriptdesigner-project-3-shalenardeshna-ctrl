@@ -1,53 +1,40 @@
 from genedesign.seq_utils.hairpin_counter import hairpin_counter
 
-
 def hairpin_checker(dna):
     """
-    Checks for bad hairpin structures in the DNA sequence.
+    Checks for bad hairpin structures in the DNA sequence by splitting it into 50 bp chunks with
+    an overlap of 25 bp, and passing each chunk to hairpin_counter. If any chunk has more than
+    1 hairpin, it returns False and the problematic hairpin string. Otherwise, it returns True and None.
 
-    Improvements over the original version:
-    - sequences shorter than 50 bp are still checked
-    - the tail/end of long sequences is always checked
-    - returns False if any checked window has >1 hairpin
+    Parameters:
+        dna (str): The DNA sequence to analyze.
+
+    Returns:
+        tuple: (bool, str or None)
+            - True and None if no problematic hairpins are found.
+            - False and the problematic hairpin string if more than one hairpin is found in any chunk.
     """
-    dna = dna.upper()
-
-    chunk_size = 50
-    step = 25
-    min_stem = 3
-    min_loop = 4
-    max_loop = 9
-
-    if len(dna) == 0:
-        return True, None
-
-    # Short sequences should still be checked.
-    if len(dna) <= chunk_size:
-        hairpin_count, hairpin_string = hairpin_counter(dna, min_stem, min_loop, max_loop)
-        if hairpin_count > 1:
-            return False, hairpin_string
-        return True, None
-
-    # Check overlapping windows across the sequence.
-    starts = list(range(0, len(dna) - chunk_size + 1, step))
-
-    # Always include the final window so the tail is not skipped.
-    final_start = len(dna) - chunk_size
-    if starts[-1] != final_start:
-        starts.append(final_start)
-
-    for i in starts:
+    chunk_size = 50  # 50 bp window
+    overlap = 25     # Overlap by 25 bp
+    min_stem = 3     # Minimum number of bases in the stem
+    min_loop = 4     # Minimum number of bases in the loop
+    max_loop = 9     # Maximum number of bases in the loop
+    
+    # Iterate over the sequence in 50 bp chunks with 25 bp overlap
+    for i in range(0, len(dna) - chunk_size + 1, overlap):
         chunk = dna[i:i + chunk_size]
+        
+        # Get the count of hairpins and the hairpin string from hairpin_counter
         hairpin_count, hairpin_string = hairpin_counter(chunk, min_stem, min_loop, max_loop)
-
+        
+        # If more than 1 hairpin is found, return False and the problematic hairpin string
         if hairpin_count > 1:
             return False, hairpin_string
-
+    
+    # If no problematic hairpin chunk is found, return True and None
     return True, None
 
-
+# Example usage
 if __name__ == "__main__":
-    result, hairpin = hairpin_checker(
-        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACCCCAAAAAAAGGGGAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-    )
+    result, hairpin = hairpin_checker("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACCCCAAAAAAAGGGGAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
     print(result, hairpin)
