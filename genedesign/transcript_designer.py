@@ -1,9 +1,8 @@
-from collections import defaultdict
+rom collections import defaultdict
 
 from genedesign.rbs_chooser import RBSChooser
 from genedesign.models.transcript import Transcript
 from genedesign.checkers.transcript_quality_checker import TranscriptQualityChecker
-from genedesign.checkers.hairpin_checker import hairpin_checker
 
 
 class TranscriptDesigner:
@@ -11,8 +10,11 @@ class TranscriptDesigner:
     Reverse-translates a protein sequence into a DNA sequence and chooses
     an RBS while trying to satisfy quality constraints.
 
-    This implementation uses a sliding-window local search over synonymous
-    codons instead of a single small global greedy pass.
+    This version uses a sliding-window repair system:
+    - try all available RBS options
+    - start from several diverse synonymous-codon seeds
+    - identify failing regions
+    - repair codons inside overlapping windows using the existing checkers
     """
 
     def __init__(self):
@@ -20,12 +22,10 @@ class TranscriptDesigner:
         self.rbsChooser = None
         self.qualityChecker = None
 
-        # Sliding-window search settings
-        self.window_codons = 12
-        self.window_step = 4
-        self.max_passes = 4
-        self.local_flank_nt = 72
-        self.max_branch = 4
+        self.window_codons = 15
+        self.window_step = 5
+        self.max_passes = 3
+        self.max_seed_phases = 4
         self.stop_codon = "TAA"
 
     def initiate(self) -> None:
@@ -39,8 +39,8 @@ class TranscriptDesigner:
 
     def _init_codon_choices(self) -> None:
         """
-        Build synonymous codon lists ordered by codon usage preference while
-        filtering rare codons when possible.
+        Build synonymous codon lists ordered by codon usage preference.
+        Keep all synonymous codons so the search can maximize diversity.
         """
         genetic_code = {
             "A": ["GCT", "GCC", "GCA", "GCG"],
@@ -65,17 +65,13 @@ class TranscriptDesigner:
             "Y": ["TAT", "TAC"],
         }
 
-        codon_checker = self.qualityChecker.codon_checker
-        freqs = codon_checker.codon_frequencies
-        rare_threshold = codon_checker.rare_codon_threshold
+        freqs = self.qualityChecker.codon_checker.codon_frequencies
 
         self.codon_choices = {}
         for aa, codons in genetic_code.items():
-            usable = [codon for codon in codons if freqs.get(codon, 0.0) >= rare_threshold]
-            if not usable:
-                usable = codons[:]
-            usable.sort(key=lambda codon: freqs.get(codon, 0.0), reverse=True)
-            self.codon_choices[aa] = usable
+            ordered = codons[:]
+            ordered.sort(key=lambda codon: freqs.get(codon, 0.0), reverse=True)
+            self.codon_choices[aa] = ordered
 
     def _available_rbs_options(self, ignores: set):
         options = [opt for opt in self.rbsChooser.rbsOptions if opt not in ignores]
@@ -83,27 +79,38 @@ class TranscriptDesigner:
             raise Exception("No valid RBS option available.")
         return options
 
-    def _seed_codons(self, peptide: str) -> list[str]:
+    def _better_report(self, new_report: dict, old_report: dict | None) -> bool:
+        if old_report is None:
+            return True
+        if new_report["rank"] < old_report["rank"]:
+            return True
+        if new_report["rank"] == old_report["rank"] and new_report["score"] > old_report["score"]:
+            return True
+        return False
+
+    def _seed_codons(self, peptide: str, phase: int = 0) -> list[str]:
         """
-        Create a high-CAI but still somewhat diverse initial CDS by rotating
-        through the best few synonymous codons for repeated amino acids.
+        Create a diverse starting CDS by rotating through *all* synonymous codons
+        for repeated amino acids.
         """
         counts = defaultdict(int)
         codons = []
 
-        for aa in peptide:
+        for i, aa in enumerate(peptide):
             choices = self.codon_choices[aa]
-            rotate = min(3, len(choices))
-            choice_index = counts[aa] % rotate
-            codons.append(choices[choice_index])
+
+            if i == 0 and aa == "M":
+                codons.append("ATG")
+                counts[aa] += 1
+                continue
+
+            idx = (counts[aa] + phase) % len(choices)
+            codons.append(choices[idx])
             counts[aa] += 1
 
         return codons
 
     def _window_ranges(self, n_positions: int) -> list[tuple[int, int]]:
-        """
-        Return overlapping sliding windows over codon positions.
-        """
         if n_positions <= self.window_codons:
             return [(0, n_positions)]
 
@@ -112,6 +119,7 @@ class TranscriptDesigner:
 
         while True:
             end = min(n_positions, start + self.window_codons)
+
             if end - start < self.window_codons:
                 start = max(0, n_positions - self.window_codons)
                 end = n_positions
@@ -128,124 +136,197 @@ class TranscriptDesigner:
 
         return windows
 
-    def _transcript_dna(self, utr: str, codons: list[str]) -> str:
-        return (utr + "".join(codons)).upper()
-
-    def _codon_score(self, codons: list[str]) -> float:
-        codons_ok, diversity, rare_count, cai = self.qualityChecker.codon_checker.run(codons)
-        score = 0.0
-        score += 25.0 if codons_ok else -25.0
-        score += 40.0 * cai
-        score += 10.0 * diversity
-        score -= 8.0 * rare_count
-        return score
-
-    def _local_structural_score(self, utr: str, codons: list[str], pos: int) -> tuple[float, bool]:
-        """
-        Score only the local region around one codon change. This keeps the
-        sliding-window search much faster than rescoring the full transcript
-        after every single synonymous substitution.
-        """
-        dna = self._transcript_dna(utr, codons)
-        center = len(utr) + (pos * 3) + 1
-        start = max(0, center - self.local_flank_nt)
-        end = min(len(dna), center + self.local_flank_nt)
-        segment = dna[start:end]
-
-        forbidden_ok, _ = self.qualityChecker.forbidden_checker.run(segment)
-        promoter_ok, _ = self.qualityChecker.promoter_checker.run(segment)
-        hairpin_ok, _ = hairpin_checker(segment)
-
-        score = 0.0
-        score += 100.0 if forbidden_ok else -200.0
-        score += 100.0 if promoter_ok else -200.0
-        score += 60.0 if hairpin_ok else -120.0
-
-        passed = forbidden_ok and promoter_ok and hairpin_ok
-        return score, passed
-
-    def _candidate_score(self, utr: str, codons: list[str], pos: int) -> tuple[float, bool]:
-        structural_score, structural_passed = self._local_structural_score(utr, codons, pos)
-        codon_score = self._codon_score(codons)
-        codons_ok, _, _, _ = self.qualityChecker.codon_checker.run(codons)
-        return structural_score + codon_score, structural_passed and codons_ok
-
-    def _better_candidate(
+    def _nt_range_to_codon_positions(
         self,
-        trial_score: float,
-        trial_passed: bool,
-        best_score: float,
-        best_passed: bool,
-    ) -> bool:
-        if trial_passed and not best_passed:
-            return True
-        if trial_passed == best_passed and trial_score > best_score:
-            return True
-        return False
+        nt_start: int,
+        nt_end: int,
+        utr_len: int,
+        peptide_len: int,
+    ) -> list[int]:
+        cds_start = max(0, nt_start - utr_len)
+        cds_end = max(0, nt_end - utr_len)
 
-    def _optimize_for_rbs(self, peptide: str, utr: str) -> tuple[list[str], dict]:
+        first = cds_start // 3
+        last_exclusive = min(peptide_len, (cds_end + 2) // 3)
+
+        if last_exclusive <= first:
+            return []
+
+        return list(range(first, last_exclusive))
+
+    def _add_motif_positions(
+        self,
+        positions: set[int],
+        transcript_dna: str,
+        motif: str | None,
+        utr_len: int,
+        peptide_len: int,
+    ) -> None:
+        if not motif:
+            return
+
+        motif = str(motif).upper()
+        if not motif:
+            return
+
+        start = transcript_dna.find(motif)
+        while start != -1:
+            end = start + len(motif)
+            for pos in self._nt_range_to_codon_positions(start, end, utr_len, peptide_len):
+                positions.add(pos)
+            start = transcript_dna.find(motif, start + 1)
+
+    def _problem_positions(
+        self,
+        peptide: str,
+        utr: str,
+        codons: list[str],
+        report: dict,
+    ) -> list[int]:
         """
-        Optimize a CDS for one fixed RBS using overlapping codon windows.
+        Convert failing checker output into codon positions to mutate.
         """
-        codons = self._seed_codons(peptide) + [self.stop_codon]
-        best_codons = codons.copy()
-        best_report = self.qualityChecker.run(utr, codons)
+        positions = set()
+        transcript_dna = (utr + "".join(codons)).upper()
+        utr_len = len(utr)
+        peptide_len = len(peptide)
 
-        if best_report["passed"]:
-            return best_codons, best_report
+        for start, end in report.get("hairpin_bad_windows", []):
+            for pos in self._nt_range_to_codon_positions(start, end, utr_len, peptide_len):
+                positions.add(pos)
 
+        self._add_motif_positions(
+            positions,
+            transcript_dna,
+            report.get("forbidden_hit"),
+            utr_len,
+            peptide_len,
+        )
+        self._add_motif_positions(
+            positions,
+            transcript_dna,
+            report.get("promoter_hit"),
+            utr_len,
+            peptide_len,
+        )
+
+        # If codon usage fails, allow the search to touch every mutable codon.
+        if not report.get("codons_ok", True) or not positions:
+            for pos, aa in enumerate(peptide):
+                if len(self.codon_choices[aa]) > 1:
+                    positions.add(pos)
+
+        return sorted(positions)
+
+    def _ordered_candidate_codons(self, aa: str, current: str, phase: int) -> list[str]:
+        choices = self.codon_choices[aa][:]
+        if len(choices) <= 1:
+            return []
+
+        shift = phase % len(choices)
+        rotated = choices[shift:] + choices[:shift]
+
+        return [codon for codon in rotated if codon != current]
+
+    def _repair_once(
+        self,
+        peptide: str,
+        utr: str,
+        codons: list[str],
+        report: dict,
+        phase: int,
+    ) -> tuple[list[str], dict]:
+        """
+        One sliding-window repair pass.
+        """
+        current_codons = codons[:]
+        current_report = report
+        target_positions = set(self._problem_positions(peptide, utr, current_codons, current_report))
         windows = self._window_ranges(len(peptide))
 
-        for pass_index in range(self.max_passes):
-            changed = False
-            ordered_windows = windows if pass_index % 2 == 0 else list(reversed(windows))
+        prioritized_windows = []
+        for start, end in windows:
+            if any(start <= pos < end for pos in target_positions):
+                prioritized_windows.append((start, end))
+        for window in windows:
+            if window not in prioritized_windows:
+                prioritized_windows.append(window)
 
-            for window_start, window_end in ordered_windows:
-                positions = list(range(window_start, window_end))
-                if pass_index % 2 == 1:
-                    positions.reverse()
+        for window_index, (start, end) in enumerate(prioritized_windows):
+            window_positions = [pos for pos in sorted(target_positions) if start <= pos < end]
+            if not window_positions:
+                continue
 
-                for pos in positions:
-                    aa = peptide[pos]
-                    current = codons[pos]
-                    local_best_codon = current
-                    local_best_score, local_best_passed = self._candidate_score(utr, codons, pos)
+            for pos in window_positions:
+                aa = peptide[pos]
+                current = current_codons[pos]
 
-                    branch_choices = self.codon_choices[aa][: self.max_branch]
-                    for alt in branch_choices:
-                        if alt == current:
-                            continue
+                best_local_codons = current_codons
+                best_local_report = current_report
 
-                        trial = codons.copy()
-                        trial[pos] = alt
-                        trial_score, trial_passed = self._candidate_score(utr, trial, pos)
+                candidate_phase = phase + window_index + pos
+                for alt in self._ordered_candidate_codons(aa, current, candidate_phase):
+                    trial_codons = current_codons[:]
+                    trial_codons[pos] = alt
+                    trial_report = self.qualityChecker.run(utr, trial_codons)
 
-                        if self._better_candidate(
-                            trial_score,
-                            trial_passed,
-                            local_best_score,
-                            local_best_passed,
-                        ):
-                            local_best_codon = alt
-                            local_best_score = trial_score
-                            local_best_passed = trial_passed
+                    if self._better_report(trial_report, best_local_report):
+                        best_local_codons = trial_codons
+                        best_local_report = trial_report
 
-                    if local_best_codon != current:
-                        codons[pos] = local_best_codon
-                        changed = True
+                if self._better_report(best_local_report, current_report):
+                    current_codons = best_local_codons
+                    current_report = best_local_report
 
-            report = self.qualityChecker.run(utr, codons)
-            if self._better_candidate(
-                report["score"],
-                report["passed"],
-                best_report["score"],
-                best_report["passed"],
-            ):
-                best_codons = codons.copy()
+                    if current_report["passed"]:
+                        return current_codons, current_report
+
+        return current_codons, current_report
+
+    def _optimize_for_rbs(self, peptide: str, rbs_option) -> tuple[list[str], dict]:
+        best_codons = None
+        best_report = None
+
+        max_phase = max(1, min(
+            self.max_seed_phases,
+            max(len(choices) for choices in self.codon_choices.values())
+        ))
+
+        for phase in range(max_phase):
+            codons = self._seed_codons(peptide, phase=phase) + [self.stop_codon]
+            report = self.qualityChecker.run(rbs_option.utr, codons)
+
+            if self._better_report(report, best_report):
+                best_codons = codons[:]
                 best_report = report
 
-            if best_report["passed"] or not changed:
-                break
+            if report["passed"]:
+                return codons, report
+
+            working_codons = codons[:]
+            working_report = report
+
+            for repair_round in range(self.max_passes):
+                new_codons, new_report = self._repair_once(
+                    peptide,
+                    rbs_option.utr,
+                    working_codons,
+                    working_report,
+                    phase + repair_round,
+                )
+
+                if self._better_report(new_report, best_report):
+                    best_codons = new_codons[:]
+                    best_report = new_report
+
+                if new_report["passed"]:
+                    return new_codons, new_report
+
+                if new_report["rank"] == working_report["rank"] and new_report["score"] <= working_report["score"]:
+                    break
+
+                working_codons = new_codons
+                working_report = new_report
 
         return best_codons, best_report
 
@@ -257,36 +338,23 @@ class TranscriptDesigner:
             if aa not in self.codon_choices:
                 raise ValueError(f"Unsupported amino acid: {aa}")
 
-        # Guaranteed fallback so this method never returns None.
-        fallback_codons = self._seed_codons(peptide) + [self.stop_codon]
-        fallback_cds = "".join(fallback_codons)
-        fallback_rbs = self.rbsChooser.run(fallback_cds, ignores)
-
+        # Guaranteed fallback so this never returns None.
+        fallback_codons = self._seed_codons(peptide, phase=0) + [self.stop_codon]
+        fallback_rbs = self.rbsChooser.run("".join(fallback_codons), ignores)
         best_transcript = Transcript(fallback_rbs, peptide, fallback_codons)
         best_report = self.qualityChecker.run(fallback_rbs.utr, fallback_codons)
 
         for rbs_option in self._available_rbs_options(ignores):
             try:
-                optimized_codons, report = self._optimize_for_rbs(peptide, rbs_option.utr)
+                codons, report = self._optimize_for_rbs(peptide, rbs_option)
+                transcript = Transcript(rbs_option, peptide, codons)
 
-                if not optimized_codons:
-                    optimized_codons = fallback_codons.copy()
-                    report = self.qualityChecker.run(rbs_option.utr, optimized_codons)
-
-                transcript = Transcript(rbs_option, peptide, optimized_codons)
-
-                if self._better_candidate(
-                    report["score"],
-                    report["passed"],
-                    best_report["score"],
-                    best_report["passed"],
-                ):
+                if self._better_report(report, best_report):
                     best_transcript = transcript
                     best_report = report
 
                 if report["passed"]:
                     return transcript
-
             except Exception:
                 continue
 
