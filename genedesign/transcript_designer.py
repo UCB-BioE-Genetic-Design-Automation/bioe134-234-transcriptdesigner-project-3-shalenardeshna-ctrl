@@ -10,12 +10,8 @@ class TranscriptDesigner:
     Reverse-translates a protein sequence into a DNA sequence and chooses
     an RBS while trying to satisfy quality constraints.
 
-    This version keeps the same overall strategy as the larger search-based
-    implementation, but trims the search so it runs much faster:
-    - try only the first few RBS options
-    - use fewer seed phases
-    - use one repair pass
-    - use non-overlapping repair windows
+    This version keeps the original model interfaces, but adds a more focused
+    hairpin-repair stage so benchmark hairpin failures are actively targeted.
     """
 
     def __init__(self):
@@ -23,12 +19,14 @@ class TranscriptDesigner:
         self.rbsChooser = None
         self.qualityChecker = None
 
-        # Tuned for speed while keeping the same search structure.
+        # Balanced for speed + stronger hairpin cleanup.
         self.window_codons = 12
-        self.window_step = 12
-        self.max_passes = 1
+        self.window_step = 6
+        self.max_passes = 2
         self.max_seed_phases = 2
-        self.max_rbs_options = 3
+        self.max_rbs_options = 2
+        self.max_hairpin_cleanup_rounds = 2
+        self.max_hairpin_positions = 12
         self.stop_codon = "TAA"
 
     def initiate(self) -> None:
@@ -41,9 +39,6 @@ class TranscriptDesigner:
         self._init_codon_choices()
 
     def _init_codon_choices(self) -> None:
-        """
-        Build synonymous codon lists ordered by codon-usage preference.
-        """
         genetic_code = {
             "A": ["GCT", "GCC", "GCA", "GCG"],
             "C": ["TGT", "TGC"],
@@ -91,10 +86,6 @@ class TranscriptDesigner:
         return False
 
     def _seed_codons(self, peptide: str, phase: int = 0) -> list[str]:
-        """
-        Create a starting CDS by rotating through synonymous codons for
-        repeated amino acids.
-        """
         counts = defaultdict(int)
         codons = []
 
@@ -178,6 +169,28 @@ class TranscriptDesigner:
                 positions.add(pos)
             start = transcript_dna.find(motif, start + 1)
 
+    def _hairpin_pressure(
+        self,
+        peptide: str,
+        utr: str,
+        report: dict,
+    ) -> dict[int, int]:
+        pressure = {}
+        utr_len = len(utr)
+        peptide_len = len(peptide)
+
+        for detail in report.get("hairpin_bad_window_details", []):
+            weight = max(1, detail.get("count", 2) - 1)
+            for pos in self._nt_range_to_codon_positions(
+                detail["start"],
+                detail["end"],
+                utr_len,
+                peptide_len,
+            ):
+                pressure[pos] = pressure.get(pos, 0) + weight
+
+        return pressure
+
     def _problem_positions(
         self,
         peptide: str,
@@ -185,40 +198,38 @@ class TranscriptDesigner:
         codons: list[str],
         report: dict,
     ) -> list[int]:
-        """
-        Convert failing checker output into codon positions to mutate.
-        """
         positions = set()
         transcript_dna = (utr + "".join(codons)).upper()
-        utr_len = len(utr)
-        peptide_len = len(peptide)
+        pressure = self._hairpin_pressure(peptide, utr, report)
 
-        for start, end in report.get("hairpin_bad_windows", []):
-            for pos in self._nt_range_to_codon_positions(start, end, utr_len, peptide_len):
-                positions.add(pos)
+        for pos in pressure:
+            positions.add(pos)
 
         self._add_motif_positions(
             positions,
             transcript_dna,
             report.get("forbidden_hit"),
-            utr_len,
-            peptide_len,
+            len(utr),
+            len(peptide),
         )
         self._add_motif_positions(
             positions,
             transcript_dna,
             report.get("promoter_hit"),
-            utr_len,
-            peptide_len,
+            len(utr),
+            len(peptide),
         )
 
-        # If codon usage fails, allow the search to touch every mutable codon.
         if not report.get("codons_ok", True) or not positions:
             for pos, aa in enumerate(peptide):
                 if len(self.codon_choices[aa]) > 1:
                     positions.add(pos)
 
-        return sorted(positions)
+        ordered_positions = sorted(
+            positions,
+            key=lambda pos: (-pressure.get(pos, 0), pos),
+        )
+        return ordered_positions
 
     def _ordered_candidate_codons(self, aa: str, current: str, phase: int) -> list[str]:
         choices = self.codon_choices[aa][:]
@@ -238,12 +249,9 @@ class TranscriptDesigner:
         report: dict,
         phase: int,
     ) -> tuple[list[str], dict]:
-        """
-        One sliding-window repair pass.
-        """
         current_codons = codons[:]
         current_report = report
-        target_positions = set(self._problem_positions(peptide, utr, current_codons, current_report))
+        target_positions = self._problem_positions(peptide, utr, current_codons, current_report)
         windows = self._window_ranges(len(peptide))
 
         prioritized_windows = []
@@ -255,7 +263,7 @@ class TranscriptDesigner:
                 prioritized_windows.append(window)
 
         for window_index, (start, end) in enumerate(prioritized_windows):
-            window_positions = [pos for pos in sorted(target_positions) if start <= pos < end]
+            window_positions = [pos for pos in target_positions if start <= pos < end]
             if not window_positions:
                 continue
 
@@ -282,6 +290,60 @@ class TranscriptDesigner:
 
                     if current_report["passed"]:
                         return current_codons, current_report
+
+        return current_codons, current_report
+
+    def _focused_hairpin_cleanup(
+        self,
+        peptide: str,
+        utr: str,
+        codons: list[str],
+        report: dict,
+    ) -> tuple[list[str], dict]:
+        current_codons = codons[:]
+        current_report = report
+
+        for cleanup_round in range(self.max_hairpin_cleanup_rounds):
+            if current_report.get("hairpin_total_excess", 0) <= 0:
+                break
+
+            pressure = self._hairpin_pressure(peptide, utr, current_report)
+            if not pressure:
+                break
+
+            candidate_positions = [
+                pos
+                for pos, _ in sorted(pressure.items(), key=lambda item: (-item[1], item[0]))
+            ][: self.max_hairpin_positions]
+
+            improved = False
+
+            for pos in candidate_positions:
+                aa = peptide[pos]
+                current = current_codons[pos]
+
+                best_local_codons = current_codons
+                best_local_report = current_report
+
+                for alt in self._ordered_candidate_codons(aa, current, cleanup_round + pos):
+                    trial_codons = current_codons[:]
+                    trial_codons[pos] = alt
+                    trial_report = self.qualityChecker.run(utr, trial_codons)
+
+                    if self._better_report(trial_report, best_local_report):
+                        best_local_codons = trial_codons
+                        best_local_report = trial_report
+
+                if self._better_report(best_local_report, current_report):
+                    current_codons = best_local_codons
+                    current_report = best_local_report
+                    improved = True
+
+                    if current_report["passed"]:
+                        return current_codons, current_report
+
+            if not improved:
+                break
 
         return current_codons, current_report
 
@@ -336,6 +398,20 @@ class TranscriptDesigner:
                 working_codons = new_codons
                 working_report = new_report
 
+            if best_report is not None and not best_report["hairpin_ok"]:
+                cleaned_codons, cleaned_report = self._focused_hairpin_cleanup(
+                    peptide,
+                    rbs_option.utr,
+                    best_codons,
+                    best_report,
+                )
+                if self._better_report(cleaned_report, best_report):
+                    best_codons = cleaned_codons[:]
+                    best_report = cleaned_report
+
+                if cleaned_report["passed"]:
+                    return cleaned_codons, cleaned_report
+
         return best_codons, best_report
 
     def run(self, peptide: str, ignores: set) -> Transcript:
@@ -346,7 +422,6 @@ class TranscriptDesigner:
             if aa not in self.codon_choices:
                 raise ValueError(f"Unsupported amino acid: {aa}")
 
-        # Guaranteed fallback so this never returns None.
         fallback_codons = self._seed_codons(peptide, phase=0) + [self.stop_codon]
         fallback_rbs = self.rbsChooser.run("".join(fallback_codons), ignores)
         best_transcript = Transcript(fallback_rbs, peptide, fallback_codons)
@@ -367,15 +442,3 @@ class TranscriptDesigner:
                 continue
 
         return best_transcript
-
-
-if __name__ == "__main__":
-    peptide = "MYPFIRTARMTV"
-
-    designer = TranscriptDesigner()
-    designer.initiate()
-
-    ignores = set()
-    transcript = designer.run(peptide, ignores)
-
-    print(transcript)
