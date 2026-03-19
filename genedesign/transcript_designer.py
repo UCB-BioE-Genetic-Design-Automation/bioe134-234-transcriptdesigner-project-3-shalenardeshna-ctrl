@@ -11,8 +11,8 @@ class TranscriptDesigner:
     Reverse-translates a protein sequence into a DNA sequence and chooses
     an RBS while trying to satisfy quality constraints.
 
-    This version uses a sliding-window local search over codons instead of a
-    single global greedy pass.
+    This implementation uses a sliding-window local search over synonymous
+    codons instead of a single small global greedy pass.
     """
 
     def __init__(self):
@@ -20,9 +20,10 @@ class TranscriptDesigner:
         self.rbsChooser = None
         self.qualityChecker = None
 
+        # Sliding-window search settings
         self.window_codons = 12
         self.window_step = 4
-        self.max_passes = 3
+        self.max_passes = 4
         self.local_flank_nt = 72
         self.max_branch = 4
         self.stop_codon = "TAA"
@@ -39,7 +40,7 @@ class TranscriptDesigner:
     def _init_codon_choices(self) -> None:
         """
         Build synonymous codon lists ordered by codon usage preference while
-        filtering out rare codons when possible.
+        filtering rare codons when possible.
         """
         genetic_code = {
             "A": ["GCT", "GCC", "GCA", "GCG"],
@@ -84,8 +85,8 @@ class TranscriptDesigner:
 
     def _seed_codons(self, peptide: str) -> list[str]:
         """
-        Create a high-CAI but still diverse starting CDS by rotating through the
-        best few synonymous codons for repeated amino acids.
+        Create a high-CAI but still somewhat diverse initial CDS by rotating
+        through the best few synonymous codons for repeated amino acids.
         """
         counts = defaultdict(int)
         codons = []
@@ -108,16 +109,21 @@ class TranscriptDesigner:
 
         windows = []
         start = 0
+
         while True:
             end = min(n_positions, start + self.window_codons)
             if end - start < self.window_codons:
                 start = max(0, n_positions - self.window_codons)
                 end = n_positions
+
             if windows and windows[-1] == (start, end):
                 break
+
             windows.append((start, end))
+
             if end >= n_positions:
                 break
+
             start += self.window_step
 
         return windows
@@ -136,8 +142,9 @@ class TranscriptDesigner:
 
     def _local_structural_score(self, utr: str, codons: list[str], pos: int) -> tuple[float, bool]:
         """
-        Score only the local region around one codon change. This is much faster
-        than rescoring the full transcript for every single candidate mutation.
+        Score only the local region around one codon change. This keeps the
+        sliding-window search much faster than rescoring the full transcript
+        after every single synonymous substitution.
         """
         dna = self._transcript_dna(utr, codons)
         center = len(utr) + (pos * 3) + 1
@@ -250,21 +257,37 @@ class TranscriptDesigner:
             if aa not in self.codon_choices:
                 raise ValueError(f"Unsupported amino acid: {aa}")
 
-        best_transcript = None
-        best_report = None
+        # Guaranteed fallback so this method never returns None.
+        fallback_codons = self._seed_codons(peptide) + [self.stop_codon]
+        fallback_cds = "".join(fallback_codons)
+        fallback_rbs = self.rbsChooser.run(fallback_cds, ignores)
+
+        best_transcript = Transcript(fallback_rbs, peptide, fallback_codons)
+        best_report = self.qualityChecker.run(fallback_rbs.utr, fallback_codons)
 
         for rbs_option in self._available_rbs_options(ignores):
-            optimized_codons, report = self._optimize_for_rbs(peptide, rbs_option.utr)
-            transcript = Transcript(rbs_option, peptide, optimized_codons)
+            try:
+                optimized_codons, report = self._optimize_for_rbs(peptide, rbs_option.utr)
 
-            if best_report is None or self._better_candidate(
-                report["score"],
-                report["passed"],
-                best_report["score"],
-                best_report["passed"],
-            ):
-                best_transcript = transcript
-                best_report = report
+                if not optimized_codons:
+                    optimized_codons = fallback_codons.copy()
+                    report = self.qualityChecker.run(rbs_option.utr, optimized_codons)
 
-            if report["passed"]:
-                return transcript
+                transcript = Transcript(rbs_option, peptide, optimized_codons)
+
+                if self._better_candidate(
+                    report["score"],
+                    report["passed"],
+                    best_report["score"],
+                    best_report["passed"],
+                ):
+                    best_transcript = transcript
+                    best_report = report
+
+                if report["passed"]:
+                    return transcript
+
+            except Exception:
+                continue
+
+        return best_transcript
