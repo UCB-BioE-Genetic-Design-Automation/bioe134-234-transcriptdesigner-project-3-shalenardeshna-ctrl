@@ -1,4 +1,4 @@
-rom collections import defaultdict
+from collections import defaultdict
 
 from genedesign.rbs_chooser import RBSChooser
 from genedesign.models.transcript import Transcript
