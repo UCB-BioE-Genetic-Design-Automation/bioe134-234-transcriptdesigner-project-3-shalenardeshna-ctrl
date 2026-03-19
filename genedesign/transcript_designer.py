@@ -10,11 +10,12 @@ class TranscriptDesigner:
     Reverse-translates a protein sequence into a DNA sequence and chooses
     an RBS while trying to satisfy quality constraints.
 
-    This version uses a sliding-window repair system:
-    - try all available RBS options
-    - start from several diverse synonymous-codon seeds
-    - identify failing regions
-    - repair codons inside overlapping windows using the existing checkers
+    This version keeps the same overall strategy as the larger search-based
+    implementation, but trims the search so it runs much faster:
+    - try only the first few RBS options
+    - use fewer seed phases
+    - use one repair pass
+    - use non-overlapping repair windows
     """
 
     def __init__(self):
@@ -22,10 +23,12 @@ class TranscriptDesigner:
         self.rbsChooser = None
         self.qualityChecker = None
 
-        self.window_codons = 15
-        self.window_step = 5
-        self.max_passes = 3
-        self.max_seed_phases = 4
+        # Tuned for speed while keeping the same search structure.
+        self.window_codons = 12
+        self.window_step = 12
+        self.max_passes = 1
+        self.max_seed_phases = 2
+        self.max_rbs_options = 3
         self.stop_codon = "TAA"
 
     def initiate(self) -> None:
@@ -39,8 +42,7 @@ class TranscriptDesigner:
 
     def _init_codon_choices(self) -> None:
         """
-        Build synonymous codon lists ordered by codon usage preference.
-        Keep all synonymous codons so the search can maximize diversity.
+        Build synonymous codon lists ordered by codon-usage preference.
         """
         genetic_code = {
             "A": ["GCT", "GCC", "GCA", "GCG"],
@@ -90,8 +92,8 @@ class TranscriptDesigner:
 
     def _seed_codons(self, peptide: str, phase: int = 0) -> list[str]:
         """
-        Create a diverse starting CDS by rotating through *all* synonymous codons
-        for repeated amino acids.
+        Create a starting CDS by rotating through synonymous codons for
+        repeated amino acids.
         """
         counts = defaultdict(int)
         codons = []
@@ -287,10 +289,13 @@ class TranscriptDesigner:
         best_codons = None
         best_report = None
 
-        max_phase = max(1, min(
-            self.max_seed_phases,
-            max(len(choices) for choices in self.codon_choices.values())
-        ))
+        max_phase = max(
+            1,
+            min(
+                self.max_seed_phases,
+                max(len(choices) for choices in self.codon_choices.values()),
+            ),
+        )
 
         for phase in range(max_phase):
             codons = self._seed_codons(peptide, phase=phase) + [self.stop_codon]
@@ -322,7 +327,10 @@ class TranscriptDesigner:
                 if new_report["passed"]:
                     return new_codons, new_report
 
-                if new_report["rank"] == working_report["rank"] and new_report["score"] <= working_report["score"]:
+                if (
+                    new_report["rank"] == working_report["rank"]
+                    and new_report["score"] <= working_report["score"]
+                ):
                     break
 
                 working_codons = new_codons
@@ -344,7 +352,7 @@ class TranscriptDesigner:
         best_transcript = Transcript(fallback_rbs, peptide, fallback_codons)
         best_report = self.qualityChecker.run(fallback_rbs.utr, fallback_codons)
 
-        for rbs_option in self._available_rbs_options(ignores):
+        for rbs_option in self._available_rbs_options(ignores)[: self.max_rbs_options]:
             try:
                 codons, report = self._optimize_for_rbs(peptide, rbs_option)
                 transcript = Transcript(rbs_option, peptide, codons)
@@ -359,3 +367,15 @@ class TranscriptDesigner:
                 continue
 
         return best_transcript
+
+
+if __name__ == "__main__":
+    peptide = "MYPFIRTARMTV"
+
+    designer = TranscriptDesigner()
+    designer.initiate()
+
+    ignores = set()
+    transcript = designer.run(peptide, ignores)
+
+    print(transcript)
