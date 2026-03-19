@@ -70,7 +70,12 @@ class TranscriptQualityChecker:
         promoter_ok, promoter_hit = self.promoter_checker.run(transcript_dna)
         hairpin_ok, hairpin_hit = hairpin_checker(transcript_dna)
 
-        hairpin_bad_windows = self._hairpin_window_failures(transcript_dna)
+        # Only do the more expensive window scan when the full transcript fails.
+        if hairpin_ok:
+            hairpin_bad_windows = []
+        else:
+            hairpin_bad_windows = self._hairpin_window_failures(transcript_dna)
+
         hard_failures = (
             int(not forbidden_ok)
             + int(not promoter_ok)
